@@ -11,7 +11,7 @@ models:
     sdk_config: rebotarm_dm.yaml
     overrides:
       name: reBotArm-B601-DM
-      urdf_path: urdf/reBot-DevArm_fixend_description/urdf/reBot-DevArm_fixend.urdf
+      urdf_path: urdf/DM/urdf/ReBot_Arm_DM.urdf
       end_effector_frame: end_link
       channel: /dev/ttyACM0
       rate: 500
@@ -36,7 +36,7 @@ models:
     sdk_config: rebotarm_rs.yaml
     overrides:
       name: reBotArm-RS
-      urdf_path: urdf/00-arm-rs_asm-v3/urdf/00-arm-rs_asm-v3.urdf
+      urdf_path: urdf/RS/urdf/ReBot_Arm_RS.urdf
       end_effector_frame: gripper_end
       channel: can0
       rate: 500

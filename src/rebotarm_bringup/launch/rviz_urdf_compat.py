@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
-"""Adapt multi-material URDF links for the ROS 2 Jazzy RViz renderer.
+"""Adapt multi-material URDF links for the ROS 2 RViz renderer.
 
-Jazzy's RobotLink passes an empty material name while creating every entry in
-``visual_array``. RViz consequently resolves every mesh in one link to that
-link's first material. Moving the additional visuals to fixed child links
-keeps the same meshes, poses, and shared URDF colours while giving RViz one
-unambiguous material per rendered link.
+Jazzy/Humble RobotLink can resolve every mesh in one link to that link's first
+material. Moving the additional visuals to fixed child links keeps the same
+meshes, poses, and shared URDF colours while giving RViz one unambiguous
+material per rendered link.
 
 The transformation only changes the URDF written to stdout. The input file is
 never modified.
+
+Usage:
+  python3 rviz_urdf_compat.py ROBOT.urdf
+  python3 rviz_urdf_compat.py -
+  python3 rviz_urdf_compat.py --xacro FILE.xacro [xacro_args...]
 """
 
+from __future__ import annotations
+
 import re
+import subprocess
 import sys
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -81,12 +88,50 @@ def make_rviz_compatible(urdf_xml: str) -> str:
     return ET.tostring(root, encoding="unicode")
 
 
+def _load_from_xacro(xacro_file: str, xacro_args: list[str]) -> str:
+    cmd = ["xacro", xacro_file, *xacro_args]
+    result = subprocess.run(
+        cmd,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+    )
+    if result.returncode != 0:
+        raise SystemExit(
+            f"xacro failed ({result.returncode}): {' '.join(cmd)}\n{result.stderr}"
+        )
+    return result.stdout
+
+
 def main() -> int:
-    if len(sys.argv) != 2:
-        print(f"usage: {Path(sys.argv[0]).name} ROBOT.urdf", file=sys.stderr)
+    if len(sys.argv) < 2:
+        print(
+            f"usage: {Path(sys.argv[0]).name} ROBOT.urdf|-|--xacro FILE [xacro_args...]",
+            file=sys.stderr,
+        )
         return 2
-    source = Path(sys.argv[1])
-    print(make_rviz_compatible(source.read_text(encoding="utf-8")))
+
+    if sys.argv[1] == "--xacro":
+        if len(sys.argv) < 3:
+            print(
+                f"usage: {Path(sys.argv[0]).name} --xacro FILE [xacro_args...]",
+                file=sys.stderr,
+            )
+            return 2
+        urdf_xml = _load_from_xacro(sys.argv[2], sys.argv[3:])
+    elif sys.argv[1] == "-":
+        urdf_xml = sys.stdin.read()
+    elif len(sys.argv) == 2:
+        urdf_xml = Path(sys.argv[1]).read_text(encoding="utf-8")
+    else:
+        print(
+            f"usage: {Path(sys.argv[0]).name} ROBOT.urdf|-|--xacro FILE [xacro_args...]",
+            file=sys.stderr,
+        )
+        return 2
+
+    print(make_rviz_compatible(urdf_xml))
     return 0
 
 

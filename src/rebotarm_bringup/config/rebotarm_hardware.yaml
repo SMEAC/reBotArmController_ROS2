@@ -4,7 +4,7 @@
 # selected model's overrides are deep-merged on top. Launch parameter channel
 # has highest priority.
 
-default_model: dm
+default_model: rs
 
 models:
   dm:
@@ -26,6 +26,7 @@ models:
           close: 0.0
       control:
         arm_control_mode: posvel
+        lowlevel_max_velocity: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
         mit_kp: [120.0, 120.0, 120.0, 18.0, 18.0, 18.0]
         mit_kd: [8.0, 8.0, 8.0, 2.0, 2.0, 2.0]
       gravity_compensation:
@@ -50,7 +51,8 @@ models:
           open: 5.0
           close: 0.0
       control:
-        arm_control_mode: mit
+        arm_control_mode: posvel
+        lowlevel_max_velocity: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
         mit_kp: [50.0, 150.0, 150.0, 50.0, 50.0, 50.0]
         mit_kd: [3.0, 10.0, 10.0, 5.0, 4.0, 4.0]
       gravity_compensation:

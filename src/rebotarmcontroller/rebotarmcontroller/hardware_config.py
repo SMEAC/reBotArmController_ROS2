@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import sys
 import tempfile
 from pathlib import Path
@@ -157,6 +158,11 @@ def _add_runtime_config(data: dict[str, Any]) -> None:
             "arm_control_mode": _arm_control_mode(data),
             "mit_kp": _control_gain(data, arm_joints, control_config, "mit_kp", "kp"),
             "mit_kd": _control_gain(data, arm_joints, control_config, "mit_kd", "kd"),
+            "lowlevel_max_velocity": _runtime_vector(
+                control_config.get("lowlevel_max_velocity", 0.5),
+                n,
+                "control.lowlevel_max_velocity",
+            ),
         },
         "gravity_compensation": {
             "kp": _gravity_gain(data, arm_joints, gravity_config, "kp"),
@@ -173,6 +179,13 @@ def _add_runtime_config(data: dict[str, Any]) -> None:
             ),
         }
     }
+    if any(
+        not math.isfinite(value) or value <= 0.0
+        for value in data["_runtime"]["control"]["lowlevel_max_velocity"]
+    ):
+        raise ValueError(
+            "control.lowlevel_max_velocity values must be finite and positive"
+        )
 
 
 def _arm_control_mode(data: dict[str, Any]) -> str:

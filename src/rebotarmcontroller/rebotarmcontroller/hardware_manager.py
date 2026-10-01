@@ -64,6 +64,20 @@ class HardwareManager:
         self._robot.get_state = self._get_arm_state
         self._arm_mit_kp = np.array(control_runtime["mit_kp"], dtype=np.float64)
         self._arm_mit_kd = np.array(control_runtime["mit_kd"], dtype=np.float64)
+        self._lowlevel_max_velocity = np.array(
+            control_runtime["lowlevel_max_velocity"], dtype=np.float64
+        )
+        joint_count = len(self._arm_group.joint_names)
+        self._lowlevel_target_pos = np.zeros(joint_count, dtype=np.float64)
+        self._lowlevel_command_pos = np.zeros(joint_count, dtype=np.float64)
+        self._lowlevel_target_vel = np.zeros(joint_count, dtype=np.float64)
+        self._lowlevel_target_tau = np.zeros(joint_count, dtype=np.float64)
+        self._lowlevel_target_kp = self._arm_mit_kp.copy()
+        self._lowlevel_target_kd = self._arm_mit_kd.copy()
+        self._lowlevel_vlim = np.array(
+            getattr(self._arm_group, "_pv_vlim"), dtype=np.float64, copy=True
+        )
+        self._lowlevel_mode = "pos_vel"
         self._endpos_ctrl = RebotArmEndPose(
             self._robot,
             arm_control_mode=self._arm_control_mode,
@@ -244,8 +258,14 @@ class HardwareManager:
     def hold_current_position(self) -> np.ndarray:
         current = self.get_joint_positions(request=True).copy()
         if self._state_machine != "SAFE_HOMING":
-            self._endpos_ctrl._q_target[:] = current
-            self._endpos_ctrl._qd_target[:] = 0.0
+            if self._is_lowlevel_loop_active():
+                self._lowlevel_target_pos[:] = current
+                self._lowlevel_command_pos[:] = current
+                self._lowlevel_target_vel.fill(0.0)
+                self._lowlevel_target_tau.fill(0.0)
+            else:
+                self._endpos_ctrl._q_target[:] = current
+                self._endpos_ctrl._qd_target[:] = 0.0
         return current
 
     @_locked
@@ -268,11 +288,15 @@ class HardwareManager:
         if self._state_machine in ("SAFE_HOMING", "TRAJ_RUNNING"):
             raise RuntimeError(f"rejecting endpos control in state {self._state_machine}")
 
-        if self.control_loop_active:
+        if (
+            self.control_loop_active
+            and getattr(self._robot, "_ctrl_fn", None) == self._endpos_loop_cb
+        ):
             self.set_state_machine("IDLE")
             return
 
-        self._robot.stop_control_loop()
+        if self.control_loop_active:
+            self._robot.stop_control_loop()
         self._start_endpos_loop()
         self._enabled = True
         self.set_state_machine("IDLE")
@@ -354,29 +378,16 @@ class HardwareManager:
     ) -> None:
         index = self._joint_index(joint_name)
         self._begin_lowlevel_streaming("mit")
-        q = self._arm_group.get_positions(request_feedback=True)
-        target_pos = np.array(q, dtype=np.float64, copy=True)
-        target_vel = np.zeros(len(self.joint_names), dtype=np.float64)
-        target_tau = np.zeros(len(self.joint_names), dtype=np.float64)
-        target_kp = np.array(self._arm_mit_kp, dtype=np.float64, copy=True)
-        target_kd = np.array(self._arm_mit_kd, dtype=np.float64, copy=True)
-        target_pos[index] = float(pos)
-        target_vel[index] = float(vel)
+        self._lowlevel_target_pos[index] = float(pos)
+        self._lowlevel_target_vel[index] = float(vel)
+        self._lowlevel_target_tau[index] = float(tau)
         # When the web sends kp=0 or kd=0, keep the hardware's default gains
         # so the motor maintains PD control without the web needing to know
         # the per-joint MIT parameters.
         if kp != 0:
-            target_kp[index] = float(kp)
+            self._lowlevel_target_kp[index] = float(kp)
         if kd != 0:
-            target_kd[index] = float(kd)
-        target_tau[index] = float(tau)
-        self._arm_group.send_mit(
-            target_pos,
-            vel=target_vel,
-            kp=target_kp,
-            kd=target_kd,
-            tau=target_tau,
-        )
+            self._lowlevel_target_kd[index] = float(kd)
         self.set_state_machine("LOWLEVEL_STREAMING")
 
     @_locked
@@ -388,14 +399,8 @@ class HardwareManager:
     ) -> None:
         index = self._joint_index(joint_name)
         self._begin_lowlevel_streaming("pos_vel")
-        q = self._arm_group.get_positions(request_feedback=True)
-        target_pos = np.array(q, dtype=np.float64, copy=True)
-        target_vlim = np.array(
-            getattr(self._arm_group, "_pv_vlim"), dtype=np.float64, copy=True
-        )
-        target_pos[index] = float(pos)
-        target_vlim[index] = float(vlim)
-        self._arm_group.send_pos_vel(target_pos, vlim=target_vlim)
+        self._lowlevel_target_pos[index] = float(pos)
+        self._lowlevel_vlim[index] = float(vlim)
         self.set_state_machine("LOWLEVEL_STREAMING")
 
     def current_pose(self):
@@ -679,8 +684,6 @@ class HardwareManager:
             raise RuntimeError("rejecting low-level command during safe home")
         if self.state_machine == "TRAJ_RUNNING":
             self.stop_motion()
-        self._robot.stop_control_loop()
-        self._endpos_ctrl._running = False
 
         if required_mode != self.mode:
             self._enter_mode(
@@ -690,7 +693,28 @@ class HardwareManager:
                 kp=self._arm_mit_kp,
                 kd=self._arm_mit_kd,
             )
+        self._lowlevel_mode = required_mode
+        if not self._is_lowlevel_loop_active():
+            if self.control_loop_active:
+                self._robot.stop_control_loop()
+            current = self._arm_group.get_positions(request_feedback=True)
+            self._lowlevel_target_pos[:] = current
+            self._lowlevel_command_pos[:] = current
+            self._lowlevel_target_vel.fill(0.0)
+            self._lowlevel_target_tau.fill(0.0)
+            self._lowlevel_target_kp[:] = self._arm_mit_kp
+            self._lowlevel_target_kd[:] = self._arm_mit_kd
+            self._lowlevel_vlim[:] = getattr(self._arm_group, "_pv_vlim")
+            self._endpos_ctrl._running = False
+            self._control_output_enabled = True
+            self._robot.start_control_loop(self._lowlevel_loop_cb)
         self.set_state_machine("LOWLEVEL_STREAMING")
+
+    def _is_lowlevel_loop_active(self) -> bool:
+        return (
+            self.control_loop_active
+            and getattr(self._robot, "_ctrl_fn", None) == self._lowlevel_loop_cb
+        )
 
     def _begin_gripper_lowlevel(self, required_mode: str) -> None:
         self._enter_mode(self._gripper_group, required_mode, "gripper")
@@ -756,6 +780,51 @@ class HardwareManager:
             if not self._control_output_enabled:
                 return
             self._endpos_ctrl._loop_cb(robot, 0.0)
+        finally:
+            self._cmd_lock.release()
+
+    @staticmethod
+    def _interpolate_lowlevel_position(
+        current: np.ndarray,
+        target: np.ndarray,
+        max_velocity: np.ndarray,
+        dt: float,
+    ) -> np.ndarray:
+        max_step = np.asarray(max_velocity, dtype=np.float64) * max(float(dt), 0.0)
+        delta = np.asarray(target, dtype=np.float64) - current
+        return current + np.clip(delta, -max_step, max_step)
+
+    def _lowlevel_loop_cb(self, _robot, dt: float) -> None:
+        if not self._cmd_lock.acquire(blocking=False):
+            return
+        try:
+            if not self._control_output_enabled:
+                return
+            self._lowlevel_command_pos[:] = self._interpolate_lowlevel_position(
+                self._lowlevel_command_pos,
+                self._lowlevel_target_pos,
+                self._lowlevel_max_velocity,
+                dt,
+            )
+            if self._lowlevel_mode == "pos_vel":
+                self._arm_group.send_pos_vel(
+                    self._lowlevel_command_pos,
+                    vlim=self._lowlevel_vlim,
+                )
+            else:
+                self._arm_group.send_mit(
+                    self._lowlevel_command_pos,
+                    vel=self._lowlevel_target_vel,
+                    kp=self._lowlevel_target_kp,
+                    kd=self._lowlevel_target_kd,
+                    tau=self._lowlevel_target_tau,
+                )
+            if self._gripper_group is not None and self.has_gripper:
+                self._gripper_group.send_mit(
+                    np.array([self._endpos_ctrl._gripper_target]),
+                    kp=self._gripper_group._mit_kp,
+                    kd=self._gripper_group._mit_kd,
+                )
         finally:
             self._cmd_lock.release()
 

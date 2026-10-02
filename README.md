@@ -54,7 +54,7 @@ The workspace contains five ROS2 packages:
 - Supports Cartesian targets: `MoveToPoseIK` service, `MoveToPose` action
 - Supports the standard `control_msgs/action/FollowJointTrajectory` interface
 - Supports gripper control: `SetGripper` service, `GripperCommand` action
-- Supports single-joint commands: `JointMitCmd`, `JointPosVelCmd`
+- Supports combined full-arm low-level streaming on `/rebotarm/joints/cmd/pos_vel` and `/rebotarm/joints/cmd/mit` using one-point `trajectory_msgs/JointTrajectory` setpoints
 
 ---
 

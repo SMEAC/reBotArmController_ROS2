@@ -13,13 +13,12 @@ from rclpy.qos import (
 )
 from rebotarm_msgs.msg import (
     ArmStatus,
-    JointMitCmd,
     JointMotorState,
-    JointPosVelCmd,
 )
 from rebotarm_msgs.srv import GripperCommand, SetGripper
 from sensor_msgs.msg import JointState
 from std_srvs.srv import Trigger
+from trajectory_msgs.msg import JointTrajectory
 
 
 _JOINT_LIMITS = (
@@ -98,40 +97,20 @@ class FakeRsDriver(Node):
         )
 
         command_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
-        self.command_subscriptions = []
-        for index, name in enumerate(self.joint_names):
-            self.command_subscriptions.append(
-                self.create_subscription(
-                    JointPosVelCmd,
-                    f"/{self.namespace}/joints/{name}/cmd/pos_vel",
-                    self._joint_pos_vel_callback(index),
-                    command_qos,
-                )
-            )
-            self.command_subscriptions.append(
-                self.create_subscription(
-                    JointMitCmd,
-                    f"/{self.namespace}/joints/{name}/cmd/mit",
-                    self._joint_mit_callback(index),
-                    command_qos,
-                )
-            )
-        self.command_subscriptions.extend(
-            [
-                self.create_subscription(
-                    JointPosVelCmd,
-                    f"/{self.namespace}/gripper/cmd/pos_vel",
-                    self._gripper_pos_vel_callback,
-                    command_qos,
-                ),
-                self.create_subscription(
-                    JointMitCmd,
-                    f"/{self.namespace}/gripper/cmd/mit",
-                    self._gripper_mit_callback,
-                    command_qos,
-                ),
-            ]
-        )
+        self.command_subscriptions = [
+            self.create_subscription(
+                JointTrajectory,
+                f"/{self.namespace}/joints/cmd/pos_vel",
+                self._combined_command_callback,
+                command_qos,
+            ),
+            self.create_subscription(
+                JointTrajectory,
+                f"/{self.namespace}/joints/cmd/mit",
+                self._combined_command_callback,
+                command_qos,
+            ),
+        ]
 
         self._service_handles = [
             self.create_service(Trigger, f"/{self.namespace}/enable", self._enable),
@@ -175,34 +154,29 @@ class FakeRsDriver(Node):
         self.publish_status()
         self.get_logger().info(
             f"RS fake driver ready: namespace=/{self.namespace}, "
-            "interface=JointPosVelCmd/JointMitCmd"
+            "interface=combined JointTrajectory low-level commands"
         )
 
-    def _joint_pos_vel_callback(self, index: int):
-        def callback(msg: JointPosVelCmd) -> None:
-            self._set_joint_target(index, msg.pos)
-
-        return callback
-
-    def _joint_mit_callback(self, index: int):
-        def callback(msg: JointMitCmd) -> None:
-            self._set_joint_target(index, msg.pos)
-
-        return callback
-
-    def _set_joint_target(self, index: int, target: float) -> None:
+    def _combined_command_callback(self, msg: JointTrajectory) -> None:
         if not self.enabled or self.state_machine == "GRAVITY_COMP":
             return
-        lower, upper = _JOINT_LIMITS[index]
-        self.targets[index] = self._clamp(float(target), lower, upper)
+        if len(msg.points) != 1 or len(msg.points[0].positions) != len(msg.joint_names):
+            return
+        targets = dict(zip(msg.joint_names, msg.points[0].positions))
+        if any(name not in targets for name in self.joint_names):
+            return
+
+        for index, name in enumerate(self.joint_names):
+            lower, upper = _JOINT_LIMITS[index]
+            self.targets[index] = self._clamp(float(targets[name]), lower, upper)
+        if "gripper" in targets:
+            self.gripper_target = self._clamp(
+                float(targets["gripper"]),
+                0.0,
+                self.gripper_open_position,
+            )
         self.state_machine = "LOWLEVEL_STREAMING"
         self.publish_status()
-
-    def _gripper_pos_vel_callback(self, msg: JointPosVelCmd) -> None:
-        self._set_gripper_target(msg.pos)
-
-    def _gripper_mit_callback(self, msg: JointMitCmd) -> None:
-        self._set_gripper_target(msg.pos)
 
     def _set_gripper_target(self, target: float) -> None:
         if not self.enabled or self.state_machine == "GRAVITY_COMP":

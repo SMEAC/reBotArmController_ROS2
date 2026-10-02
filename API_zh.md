@@ -37,12 +37,8 @@
 | Action | `/rebotarm/move_to_pose` | `rebotarm_msgs/action/MoveToPose` | 末端位姿轨迹 |
 | Action | `/rebotarm/follow_joint_trajectory` | `control_msgs/action/FollowJointTrajectory` | 标准关节轨迹 |
 | Action | `/rebotarm/gripper/command` | `control_msgs/action/GripperCommand` | 标准夹爪 action |
-| Command Topic | `/rebotarm/joints/<joint>/cmd/mit` | `rebotarm_msgs/msg/JointMitCmd` | 单关节 MIT raw command |
-| Command Topic | `/rebotarm/joints/<joint>/cmd/pos_vel` | `rebotarm_msgs/msg/JointPosVelCmd` | 单关节位置速度 raw command |
-| Command Topic | `/rebotarm/joints/<joint>/cmd/vel` | `rebotarm_msgs/msg/JointVelCmd` | 单关节速度 raw command |
-| Command Topic | `/rebotarm/gripper/cmd/mit` | `rebotarm_msgs/msg/JointMitCmd` | 夹爪 MIT raw command |
-| Command Topic | `/rebotarm/gripper/cmd/pos_vel` | `rebotarm_msgs/msg/JointPosVelCmd` | 夹爪位置速度 raw command |
-| Command Topic | `/rebotarm/gripper/cmd/vel` | `rebotarm_msgs/msg/JointVelCmd` | 夹爪速度 raw command |
+| Command Topic | `/rebotarm/joints/cmd/mit` | `trajectory_msgs/msg/JointTrajectory` | 全臂及可选夹爪 MIT streaming setpoint |
+| Command Topic | `/rebotarm/joints/cmd/pos_vel` | `trajectory_msgs/msg/JointTrajectory` | 全臂及可选夹爪位置速度 streaming setpoint |
 
 ## 1. 基本约定
 
@@ -573,9 +569,12 @@ ros2 action send_goal /rebotarm/gripper/command control_msgs/action/GripperComma
 | `reject` | 轨迹运行时拒绝低层命令，默认 |
 | `preempt` | 轨迹运行时 arm joint 低层命令抢占轨迹 |
 
-低层 command 按控制模式拆分为 MIT、位置速度、速度三类 topic。
+低层 command 使用两个 combined topic。每条消息包含全部 arm 关节的名字和位置，
+也可以包括配置中的单个 gripper actuator joint。消息使用一个 trajectory point，
+每次发布都会更新 persistent low-level control loop 的目标；发布端应周期性发布新目标。
 
-注意：低层 command topic 使用电机原始单位，`pos` 为 rad，`vel` 为 rad/s。
+注意：低层 command topic 使用电机原始单位，`positions` 为 rad，
+`velocities` 为 rad/s，MIT `effort` 为 N·m。
 夹爪 service、action 和低层 command 都使用夹爪电机角度 rad。
 
 安全约束：
@@ -583,101 +582,52 @@ ros2 action send_goal /rebotarm/gripper/command control_msgs/action/GripperComma
 - 重力补偿运行时拒绝全部低层 command。
 - 轨迹运行时，arm joint 低层 command 默认拒绝；只有 `cmd_arbitration:=preempt` 时才会先停止轨迹再进入低层模式。
 - 轨迹运行时，gripper 低层 command 始终拒绝，不抢占 arm 轨迹。
-- 夹爪 MIT / POS_VEL command 的 `pos` 会按当前模型的配置范围校验。
+- combined topic 的 gripper 位置会按当前模型的配置范围校验。
 - 低层 command 是调试入口，不做轨迹规划、IK 或 URDF joint limit 校验；应用层运动优先使用 action / service。
 
-### `/rebotarm/joints/<joint>/cmd/mit`
+### `/rebotarm/joints/cmd/mit`
 
 类型：
 
 ```text
-rebotarm_msgs/msg/JointMitCmd
+trajectory_msgs/msg/JointTrajectory
 ```
 
 QoS：RELIABLE，depth 10
 
-说明：单关节 MIT 模式 raw command。`<joint>` 可为 `joint1` 到 `joint6`。
+说明：combined MIT setpoint。`joint_names` 必须包含硬件配置中全部 arm joints，
+并可选包含 gripper actuator joint。`points` 必须只有一个元素；该 point 的
+`positions` 必填，`velocities` 和 `effort` 可选，分别用于 MIT velocity 和 torque。
+`kp` / `kd` 使用硬件配置的默认值。
 
 示例：
 
 ```bash
-ros2 topic pub --once /rebotarm/joints/joint1/cmd/mit rebotarm_msgs/msg/JointMitCmd \
-  "{pos: 0.0, vel: 0.0, kp: 80.0, kd: 4.0, tau: 0.0}"
+ros2 topic pub --once /rebotarm/joints/cmd/mit trajectory_msgs/msg/JointTrajectory \
+  "{joint_names: [joint1, joint2, joint3, joint4, joint5, joint6], points: [{positions: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], velocities: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], effort: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}]}"
 ```
 
-### `/rebotarm/joints/<joint>/cmd/pos_vel`
+### `/rebotarm/joints/cmd/pos_vel`
 
 类型：
 
 ```text
-rebotarm_msgs/msg/JointPosVelCmd
+trajectory_msgs/msg/JointTrajectory
 ```
 
 QoS：RELIABLE，depth 10
 
-说明：单关节位置速度模式 raw command。
+说明：combined POS_VEL setpoint。`joint_names` 必须包含硬件配置中全部 arm joints，
+并可选包含 gripper actuator joint。`points` 必须只有一个元素，`positions` 必填。
+每个关节的电机速度限值取自硬件配置，主机端还会应用 `control.lowlevel_max_velocity`
+限制位置目标的变化速率。
 
 示例：
 
 ```bash
-ros2 topic pub --once /rebotarm/joints/joint1/cmd/pos_vel rebotarm_msgs/msg/JointPosVelCmd \
-  "{pos: 0.1, vlim: 0.2}"
+ros2 topic pub --once /rebotarm/joints/cmd/pos_vel trajectory_msgs/msg/JointTrajectory \
+  "{joint_names: [joint1, joint2, joint3, joint4, joint5, joint6], points: [{positions: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}]}"
 ```
-
-### `/rebotarm/joints/<joint>/cmd/vel`
-
-类型：
-
-```text
-rebotarm_msgs/msg/JointVelCmd
-```
-
-QoS：RELIABLE，depth 10
-
-说明：单关节速度模式 raw command。
-
-示例：
-
-```bash
-ros2 topic pub --once /rebotarm/joints/joint1/cmd/vel rebotarm_msgs/msg/JointVelCmd \
-  "{vel: 0.05}"
-```
-
-### `/rebotarm/gripper/cmd/mit`
-
-类型：
-
-```text
-rebotarm_msgs/msg/JointMitCmd
-```
-
-QoS：RELIABLE，depth 10
-
-说明：夹爪 MIT 模式 raw command。
-
-### `/rebotarm/gripper/cmd/pos_vel`
-
-类型：
-
-```text
-rebotarm_msgs/msg/JointPosVelCmd
-```
-
-QoS：RELIABLE，depth 10
-
-说明：夹爪位置速度模式 raw command。
-
-### `/rebotarm/gripper/cmd/vel`
-
-类型：
-
-```text
-rebotarm_msgs/msg/JointVelCmd
-```
-
-QoS：RELIABLE，depth 10
-
-说明：夹爪速度模式 raw command。
 
 ## 6. 自定义消息定义
 

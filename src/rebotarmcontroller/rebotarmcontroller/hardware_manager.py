@@ -78,6 +78,13 @@ class HardwareManager:
             getattr(self._arm_group, "_pv_vlim"), dtype=np.float64, copy=True
         )
         self._lowlevel_mode = "pos_vel"
+        self._lowlevel_gripper_mode: str | None = None
+        self._lowlevel_gripper_target_pos = np.zeros(1, dtype=np.float64)
+        self._lowlevel_gripper_target_vel = np.zeros(1, dtype=np.float64)
+        self._lowlevel_gripper_target_tau = np.zeros(1, dtype=np.float64)
+        self._lowlevel_gripper_target_kp = np.zeros(1, dtype=np.float64)
+        self._lowlevel_gripper_target_kd = np.zeros(1, dtype=np.float64)
+        self._lowlevel_gripper_vlim = np.ones(1, dtype=np.float64)
         self._endpos_ctrl = RebotArmEndPose(
             self._robot,
             arm_control_mode=self._arm_control_mode,
@@ -88,6 +95,22 @@ class HardwareManager:
             if self.has_gripper and self._gripper_group.joint_names
             else ""
         )
+        if self.has_gripper:
+            self._lowlevel_gripper_target_kp = np.array(
+                getattr(self._gripper_group, "_mit_kp"),
+                dtype=np.float64,
+                copy=True,
+            )
+            self._lowlevel_gripper_target_kd = np.array(
+                getattr(self._gripper_group, "_mit_kd"),
+                dtype=np.float64,
+                copy=True,
+            )
+            self._lowlevel_gripper_vlim = np.array(
+                getattr(self._gripper_group, "_pv_vlim"),
+                dtype=np.float64,
+                copy=True,
+            )
         gripper_limits = hardware_data.get("gripper", {}).get("position_limits", {})
         self.gripper_open_position = float(gripper_limits.get("open", 0.0))
         self.gripper_close_position = float(gripper_limits.get("close", 0.0))
@@ -131,6 +154,11 @@ class HardwareManager:
         if self.model_name == "dm":
             return ["finger_left", "finger_right"]
         return ["gripper_joint1", "gripper_joint2"]
+
+    @property
+    def gripper_command_name(self) -> str:
+        """Configured single actuator name for the optional gripper group."""
+        return self._gripper_name
 
     def _configure_gripper_position_limits(self) -> None:
         open_position = self.gripper_open_position
@@ -204,6 +232,8 @@ class HardwareManager:
             self._robot.connect()
             if self.has_gripper:
                 self._gripper_target_position = self.get_gripper_state()[0]
+                self._endpos_ctrl._gripper_target = self._gripper_target_position
+                self._lowlevel_gripper_target_pos[0] = self._gripper_target_position
             self._start_endpos_loop()
             self._connected = True
             self._enabled = True
@@ -401,6 +431,64 @@ class HardwareManager:
         self._begin_lowlevel_streaming("pos_vel")
         self._lowlevel_target_pos[index] = float(pos)
         self._lowlevel_vlim[index] = float(vlim)
+        self.set_state_machine("LOWLEVEL_STREAMING")
+
+    @_locked
+    def set_lowlevel_joint_targets(
+        self,
+        mode: str,
+        positions: dict[str, float],
+        velocities: dict[str, float] | None = None,
+        torques: dict[str, float] | None = None,
+    ) -> None:
+        """Atomically update a complete arm setpoint and optional gripper setpoint."""
+        if mode not in ("pos_vel", "mit"):
+            raise ValueError(f"unsupported low-level mode: {mode}")
+
+        arm_names = self.joint_names
+        allowed_names = set(arm_names)
+        if self.has_gripper:
+            allowed_names.add(self.gripper_command_name)
+        unknown = set(positions) - allowed_names
+        missing = set(arm_names) - set(positions)
+        if unknown:
+            raise ValueError(f"unknown command joints: {sorted(unknown)}")
+        if missing:
+            raise ValueError(f"command is missing arm joints: {sorted(missing)}")
+
+        velocities = velocities or {}
+        torques = torques or {}
+        for label, values in (
+            ("position", positions),
+            ("velocity", velocities),
+            ("torque", torques),
+        ):
+            if any(not math.isfinite(float(value)) for value in values.values()):
+                raise ValueError(f"joint {label} values must be finite")
+
+        gripper_value = positions.get(self.gripper_command_name)
+        if gripper_value is not None:
+            gripper_value = self.validate_gripper_position(gripper_value)
+
+        self._begin_lowlevel_streaming(mode)
+        for name in arm_names:
+            index = self._joint_index(name)
+            self._lowlevel_target_pos[index] = float(positions[name])
+            self._lowlevel_target_vel[index] = float(velocities.get(name, 0.0))
+            self._lowlevel_target_tau[index] = float(torques.get(name, 0.0))
+
+        if gripper_value is not None:
+            self._begin_gripper_lowlevel(mode)
+            self._lowlevel_gripper_mode = mode
+            self._lowlevel_gripper_target_pos[0] = gripper_value
+            self._lowlevel_gripper_target_vel[0] = float(
+                velocities.get(self.gripper_command_name, 0.0)
+            )
+            self._lowlevel_gripper_target_tau[0] = float(
+                torques.get(self.gripper_command_name, 0.0)
+            )
+            self._gripper_target_position = gripper_value
+            self._endpos_ctrl._gripper_target = gripper_value
         self.set_state_machine("LOWLEVEL_STREAMING")
 
     def current_pose(self):
@@ -748,6 +836,7 @@ class HardwareManager:
         self._endpos_ctrl._running = True
 
     def _configure_groups_for_endpos(self) -> None:
+        self._lowlevel_gripper_mode = None
         if self._arm_control_mode == "mit":
             self._arm_group.mode_mit(
                 kp=self._arm_mit_kp,
@@ -819,12 +908,26 @@ class HardwareManager:
                     kd=self._lowlevel_target_kd,
                     tau=self._lowlevel_target_tau,
                 )
-            if self._gripper_group is not None and self.has_gripper:
-                self._gripper_group.send_mit(
-                    np.array([self._endpos_ctrl._gripper_target]),
-                    kp=self._gripper_group._mit_kp,
-                    kd=self._gripper_group._mit_kd,
-                )
+            if getattr(self, "_gripper_group", None) is not None and self.has_gripper:
+                if self._lowlevel_gripper_mode == "pos_vel":
+                    self._gripper_group.send_pos_vel(
+                        self._lowlevel_gripper_target_pos,
+                        vlim=self._lowlevel_gripper_vlim,
+                    )
+                elif self._lowlevel_gripper_mode == "mit":
+                    self._gripper_group.send_mit(
+                        self._lowlevel_gripper_target_pos,
+                        vel=self._lowlevel_gripper_target_vel,
+                        kp=self._lowlevel_gripper_target_kp,
+                        kd=self._lowlevel_gripper_target_kd,
+                        tau=self._lowlevel_gripper_target_tau,
+                    )
+                else:
+                    self._gripper_group.send_mit(
+                        np.array([self._endpos_ctrl._gripper_target]),
+                        kp=self._gripper_group._mit_kp,
+                        kd=self._gripper_group._mit_kd,
+                    )
         finally:
             self._cmd_lock.release()
 

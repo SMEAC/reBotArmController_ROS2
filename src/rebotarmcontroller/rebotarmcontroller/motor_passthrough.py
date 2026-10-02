@@ -1,10 +1,9 @@
 from __future__ import annotations
 
+import math
+
 from rclpy.qos import QoSProfile, ReliabilityPolicy
-from rebotarm_msgs.msg import (
-    JointMitCmd,
-    JointPosVelCmd,
-)
+from trajectory_msgs.msg import JointTrajectory
 
 
 class MotorPassthrough:
@@ -15,68 +14,18 @@ class MotorPassthrough:
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
         self._subscriptions = []
 
-        joint_commands = (
-            (
-                JointMitCmd,
-                "cmd/mit",
-                lambda hw, name, msg: hw.send_joint_mit_cmd(
-                    name,
-                    msg.pos,
-                    msg.vel,
-                    msg.kp,
-                    msg.kd,
-                    msg.tau,
-                ),
-            ),
-            (
-                JointPosVelCmd,
-                "cmd/pos_vel",
-                lambda hw, name, msg: hw.send_joint_pos_vel_cmd(
-                    name,
-                    msg.pos,
-                    msg.vlim,
-                ),
-            ),
+        self._subscribe(
+            JointTrajectory,
+            f"/{namespace}/joints/cmd/pos_vel",
+            self._make_combined_callback("pos_vel"),
+            qos,
         )
-        gripper_commands = (
-            (
-                JointMitCmd,
-                "cmd/mit",
-                lambda hw, msg: hw.send_gripper_mit_cmd(
-                    msg.pos,
-                    msg.vel,
-                    msg.kp,
-                    msg.kd,
-                    msg.tau,
-                ),
-            ),
-            (
-                JointPosVelCmd,
-                "cmd/pos_vel",
-                lambda hw, msg: hw.send_gripper_pos_vel_cmd(msg.pos, msg.vlim),
-            ),
+        self._subscribe(
+            JointTrajectory,
+            f"/{namespace}/joints/cmd/mit",
+            self._make_combined_callback("mit"),
+            qos,
         )
-
-        for joint_name in hardware.joint_names:
-            for msg_type, label, command in joint_commands:
-                self._subscribe(
-                    msg_type,
-                    f"/{namespace}/joints/{joint_name}/{label}",
-                    self._make_joint_callback(
-                        joint_name,
-                        label,
-                        command,
-                    ),
-                    qos,
-                )
-        if hardware.has_gripper:
-            for msg_type, label, command in gripper_commands:
-                self._subscribe(
-                    msg_type,
-                    f"/{namespace}/gripper/{label}",
-                    self._make_gripper_callback(label, command),
-                    qos,
-                )
 
     def _subscribe(self, msg_type, topic: str, callback, qos: QoSProfile) -> None:
         self._subscriptions.append(
@@ -89,41 +38,82 @@ class MotorPassthrough:
             )
         )
 
-    def _make_joint_callback(self, joint_name: str, label: str, command) -> object:
+    def _make_combined_callback(self, mode: str) -> object:
+        topic = f"/joints/cmd/{mode}"
+
         def _callback(msg) -> None:
             if not self._can_send_lowlevel(
-                f"/joints/{joint_name}/{label}",
+                topic,
                 allow_preempt=True,
             ):
                 return
 
             try:
-                command(self._hardware, joint_name, msg)
+                positions, velocities, torques = self._trajectory_setpoints(msg)
+                self._hardware.set_lowlevel_joint_targets(
+                    mode,
+                    positions,
+                    velocities=velocities,
+                    torques=torques,
+                )
             except Exception as exc:
                 self._node.get_logger().warn(
-                    f"joint {label} failed for {joint_name}: {exc}"
+                    f"combined {mode} command rejected: {exc}"
                 )
             finally:
                 self._node.publish_arm_status()
 
         return _callback
 
-    def _make_gripper_callback(self, label: str, command) -> object:
-        def _callback(msg) -> None:
-            if not self._can_send_lowlevel(
-                f"/gripper/{label}",
-                allow_preempt=False,
-            ):
-                return
+    def _trajectory_setpoints(
+        self,
+        msg: JointTrajectory,
+    ) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
+        if len(msg.points) != 1:
+            raise ValueError("streaming command must contain exactly one trajectory point")
+        names = list(msg.joint_names)
+        if not names:
+            raise ValueError("joint_names must not be empty")
+        if len(names) != len(set(names)):
+            raise ValueError("joint_names must not contain duplicates")
 
-            try:
-                command(self._hardware, msg)
-            except Exception as exc:
-                self._node.get_logger().warn(f"gripper {label} failed: {exc}")
-            finally:
-                self._node.publish_arm_status()
+        point = msg.points[0]
+        if len(point.positions) != len(names):
+            raise ValueError("point.positions length must match joint_names")
+        positions = {name: float(value) for name, value in zip(names, point.positions)}
+        if any(not math.isfinite(value) for value in positions.values()):
+            raise ValueError("position values must be finite")
 
-        return _callback
+        arm_names = set(self._hardware.joint_names)
+        missing_arm = arm_names - set(names)
+        if missing_arm:
+            raise ValueError(f"missing arm joints: {sorted(missing_arm)}")
+        gripper_name = self._hardware.gripper_command_name
+        allowed_names = arm_names | ({gripper_name} if gripper_name else set())
+        unknown_names = set(names) - allowed_names
+        if unknown_names:
+            raise ValueError(f"unknown command joints: {sorted(unknown_names)}")
+
+        velocities = self._optional_point_values(point.velocities, names, "velocities")
+        torques = self._optional_point_values(point.effort, names, "effort")
+        return positions, velocities, torques
+
+    @staticmethod
+    def _optional_point_values(
+        values,
+        names: list[str],
+        label: str,
+    ) -> dict[str, float]:
+        if not values:
+            return {}
+        if len(values) != len(names):
+            raise ValueError(
+                f"point.{label} length must match joint_names when provided"
+            )
+        result = {name: float(value) for name, value in zip(names, values)}
+        if any(not math.isfinite(value) for value in result.values()):
+            raise ValueError(f"{label} values must be finite")
+        return result
 
     def _can_send_lowlevel(self, label: str, *, allow_preempt: bool) -> bool:
         state = self._hardware.state_machine

@@ -19,6 +19,7 @@ setup(
     entry_points={
         "console_scripts": [
             "reBotArmController = rebotarmcontroller.rebotarm_controller:main",
+            "jointPublisherTest = rebotarmcontroller.joint_publisher_test:main",
             "FakeRsDriver = rebotarmcontroller.fake_rs_driver:main",
             "GravityCompensation = rebotarmcontroller.examples.gravity_compensation:main",
             "GripperControl = rebotarmcontroller.examples.gripper_control:main",

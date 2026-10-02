@@ -53,7 +53,7 @@
 - 支持笛卡尔目标：`MoveToPoseIK` service、`MoveToPose` action
 - 支持标准轨迹接口：`control_msgs/action/FollowJointTrajectory`
 - 支持夹爪控制：`SetGripper` service、`GripperCommand` action
-- 支持单个关节指令：`JointMitCmd`、`JointPosVelCmd`
+- 支持全臂低层 streaming：`/rebotarm/joints/cmd/pos_vel` 和 `/rebotarm/joints/cmd/mit`，使用单点 `trajectory_msgs/JointTrajectory`
 
 ---
 

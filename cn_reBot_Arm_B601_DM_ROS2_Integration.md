@@ -545,10 +545,11 @@ ROS2 工作空间也提供低层电机调试 topic：
 
 | API | 类型 | 说明 |
 |---|---|---|
-| `/rebotarm/joints/<joint>/cmd/mit` | `rebotarm_msgs/msg/JointMitCmd` | 单关节 MIT raw command |
-| `/rebotarm/joints/<joint>/cmd/pos_vel` | `rebotarm_msgs/msg/JointPosVelCmd` | 单关节位置速度 raw command |
-| `/rebotarm/gripper/cmd/mit` | `rebotarm_msgs/msg/JointMitCmd` | 夹爪 MIT raw command |
-| `/rebotarm/gripper/cmd/pos_vel` | `rebotarm_msgs/msg/JointPosVelCmd` | 夹爪位置速度 raw command |
+| `/rebotarm/joints/cmd/mit` | `trajectory_msgs/msg/JointTrajectory` | 全臂及可选夹爪 MIT streaming setpoint |
+| `/rebotarm/joints/cmd/pos_vel` | `trajectory_msgs/msg/JointTrajectory` | 全臂及可选夹爪位置速度 streaming setpoint |
+
+每条消息需要包含全部已配置 arm joints，使用一个 trajectory point；夹爪 actuator joint 可选。
+周期发布消息以更新 persistent low-level loop 的 setpoint。
 
 :::caution
 低层 command topic 面向调试和实验，不做 IK、轨迹规划或 URDF 合法性检查。应用层运动建议优先使用 `/move_to_pose`、`/follow_joint_trajectory`、`/gripper/set` 等 service/action。
